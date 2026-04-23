@@ -1,0 +1,17 @@
+# devShells.default
+{...}: {
+  perSystem = {pkgs, ...}: {
+    devShells.default = pkgs.mkShell {
+      packages = with pkgs; [
+        zig
+        zls
+      ];
+
+      env = {};
+
+      shellHook = ''
+        zig version
+      '';
+    };
+  };
+}
