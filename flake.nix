@@ -1,5 +1,5 @@
 {
-  description = "";
+  description = "g602 userspace input interposer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -10,7 +10,11 @@
     };
   };
 
-  outputs = inputs @ {flake-parts, ...}:
+  outputs = inputs @ {
+    self,
+    flake-parts,
+    ...
+  }:
     flake-parts.lib.mkFlake {inherit inputs;} {
       systems = [
         "x86_64-linux"
@@ -21,16 +25,27 @@
         ./nix/devshells.nix
       ];
 
-      perSystem = {system, ...}: let
-        pkgs = import inputs.nixpkgs {
-          inherit system;
-        };
-      in {
+      perSystem = {
+        system,
+        pkgs,
+        ...
+      }: {
         _module.args = {
-          inherit pkgs;
+          pkgs = import inputs.nixpkgs {inherit system;};
         };
 
+        packages.default = pkgs.callPackage ./nix/package.nix {};
+
         formatter = pkgs.alejandra;
+      };
+
+      flake.nixosModules.default = {
+        lib,
+        pkgs,
+        ...
+      }: {
+        imports = [./nix/module.nix];
+        services.g602.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       };
     };
 }
