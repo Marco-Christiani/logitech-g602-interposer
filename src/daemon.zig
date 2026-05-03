@@ -7,6 +7,7 @@ const linux = @import("linux.zig");
 const config_mod = @import("config.zig");
 const log_mod = @import("log.zig");
 const builtin = @import("builtin");
+const print = std.debug.print;
 
 const log = std.log.scoped(.@"g602/daemon");
 
@@ -325,7 +326,7 @@ pub const State = struct {
                 self.current_mode = snap.mode;
                 if (self.trace) {
                     const diff = g602.diffMask(self.held_mask, snap.mask);
-                    std.debug.print(
+                    print(
                         "hidraw: mask=0x{x:0>4} mode={s} prev=0x{x:0>4} pressed=0x{x:0>4} released=0x{x:0>4}\n",
                         .{ snap.mask, @tagName(snap.mode), self.held_mask, diff.pressed, diff.released },
                     );
@@ -572,9 +573,9 @@ fn to_sentinel(path: []const u8) ![256:0]u8 {
 }
 
 fn trace_hidraw(bytes: []const u8) void {
-    std.debug.print("hidraw: raw[{d}]=", .{bytes.len});
-    for (bytes) |b| std.debug.print(" {x:0>2}", .{b});
-    std.debug.print("\n", .{});
+    print("hidraw: raw[{d}]=", .{bytes.len});
+    for (bytes) |b| print(" {x:0>2}", .{b});
+    print("\n", .{});
 }
 
 fn trace_evdev(ev: g602.InputEvent, action: g602.EvdevAction) void {
@@ -586,7 +587,7 @@ fn trace_evdev(ev: g602.InputEvent, action: g602.EvdevAction) void {
         c.EV_MSC => "EV_MSC",
         else => "EV_?",
     };
-    std.debug.print(
+    print(
         "evdev:  type={s:<6} code=0x{x:0>3} value={d:<5} -> {s}\n",
         .{ type_s, ev.code, ev.value, @tagName(action) },
     );

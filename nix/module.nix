@@ -62,6 +62,20 @@ in {
       '';
     };
 
+    silenceKernelSpam = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Replace the in-tree hid-logitech-dj kernel module with a patched
+        build that silences the "Unexpected input report number 128" error
+        logged on every G602 button press. The G602 sends HID report 0x80
+        as its proprietary snapshot stream; the in-tree driver does not
+        recognise it and logs hid_err, even though the daemon consumes it
+        correctly via hidraw. Disabling this option restores the in-tree
+        module and the kernel spam.
+      '';
+    };
+
     autoStart = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -138,6 +152,16 @@ in {
     # /dev/uinput only exists when the uinput module is loaded.
     # Not loaded by default on some kernels.
     boot.kernelModules = ["uinput"];
+
+    boot.extraModulePackages = lib.optionals cfg.silenceKernelSpam [
+      (config.boot.kernelPackages.callPackage ./hid-logitech-dj.nix {})
+    ];
+
+    # The patched out-of-tree module replaces the in-tree one. Both cannot
+    # be loaded simultaneously; blacklisting ensures the kernel loads ours.
+    boot.blacklistedKernelModules = lib.optionals cfg.silenceKernelSpam [
+      "hid_logitech_dj"
+    ];
 
     environment.systemPackages = [cfg.package];
 

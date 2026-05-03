@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !u8 {
             print("hint: set [devices] hidraw = ... and evdev = ... in config\n", .{});
             return 1;
         }
-        log.debug("auto-resolution failed ({s}); using explicit [devices] paths", .{@errorName(err)});
+        log.info("auto-resolution failed ({s}); using explicit [devices] paths", .{@errorName(err)});
         break :blk null;
     };
 

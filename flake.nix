@@ -2,7 +2,7 @@
   description = "g602 userspace input interposer";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/1267bb4920d0fc06ea916734c11b0bf004bbe17e";
 
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
@@ -35,6 +35,7 @@
         };
 
         packages.default = pkgs.callPackage ./nix/package.nix {};
+        packages.hid-logitech-dj-patched = pkgs.linuxPackages.callPackage ./nix/hid-logitech-dj.nix {};
 
         formatter = pkgs.alejandra;
       };
