@@ -1,0 +1,15 @@
+[daemon]
+log_level = "info"
+
+[bindings]
+g4 = "copy"
+g5 = "paste"
+g6 = "enter"
+g7 = "alt+n" # next multiplexer tab
+g8 = "alt+p" # prev multiplexer tab
+g9 = "mute"
+g10 = "forward"
+g11 = "back"
+
+[bindings.b]
+g5 = "ctrl+shift+v" # not all terminal/multiplexer combos respect paste keycode
