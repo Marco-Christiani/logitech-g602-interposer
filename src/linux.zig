@@ -23,7 +23,7 @@ pub const SyscallError = error{SyscallFailed};
 /// Generic "rc < 0 means failed" check that also logs the syscall name and
 /// errno, so a startup or runtime failure tells you which step blew up
 /// without needing a full error return trace.
-fn ok(rc: anytype, op: []const u8) SyscallError!void {
+pub fn ok(rc: anytype, op: []const u8) SyscallError!void {
     if (rc < 0) {
         const e = std.posix.errno(rc);
         log.err("{s} failed: errno={s}({d})", .{ op, @tagName(e), @intFromEnum(e) });

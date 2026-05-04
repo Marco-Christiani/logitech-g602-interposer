@@ -2,7 +2,7 @@
   description = "g602 userspace input interposer";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/1267bb4920d0fc06ea916734c11b0bf004bbe17e";
+    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
 
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
