@@ -4,12 +4,25 @@ Userspace input interposer for the Logitech G602 wireless gaming mouse. Maps the
 
 ## How it works
 
-The daemon opens two device nodes:
+The daemon opens a hidraw node and a pointer evdev node:
 
 - **hidraw** - reads proprietary HID report 0x80 from the G602, which carries a bitmask of currently-held G-buttons as a snapshot on every state change.
 - **evdev** - exclusively grabs the real mouse event node, reads motion and standard button events, and relays them to a virtual mouse created via uinput. This prevents the desktop from seeing both the real and virtual device simultaneously.
 
-A second uinput device (virtual keyboard) emits key events for configured G-button bindings. The daemon auto-resolves both device paths from sysfs on startup; no hardcoded paths needed.
+A second uinput device (virtual keyboard) emits key events for configured G-button bindings. On receiver-level layouts, the daemon also grabs and drains the sibling keyboard evdev node. The daemon resolves these nodes from sysfs on startup, so no device paths need to be configured.
+
+### Receiver and driver layouts
+
+The physical receiver and logical HID++ G602 child use two product IDs:
+
+- `046d:c537` is the physical Logitech receiver.
+- `046d:402c` is the logical HID++ G602 child device.
+
+When `hid_logitech_dj` and `hid_logitech_hidpp` bind the receiver, sysfs usually exposes a logical `Logitech G602` evdev node with product `402c`. The resolver prefers that node.
+
+When the receiver is handled as generic HID, sysfs may expose only receiver-level `c537` nodes. In that layout the resolver uses the receiver pointer node, then grabs and drains the sibling `Logitech USB Receiver Keyboard` node so firmware key events from G-button presses do not reach the desktop.
+
+The hidraw selection does not depend on either product ID. It scans Logitech hidraw nodes and chooses the one whose HID report descriptor declares report ID `0x80`, the G-button snapshot stream.
 
 ## Quick start
 
@@ -78,7 +91,7 @@ log_level = "info"   # debug | info | warn | err
 
 ### Device overrides
 
-The auto-resolver picks the correct hidraw and evdev nodes from sysfs. Manual overrides exist as a debug escape hatch - the kernel-assigned `/dev/hidrawN` and `/dev/input/eventM` numbers shift on receiver replug, so hardcoded paths break.
+The auto-resolver picks the correct hidraw and evdev nodes from sysfs. Manual overrides are a debug escape hatch because the kernel-assigned `/dev/hidrawN` and `/dev/input/eventM` numbers shift on receiver replug. An `evdev` override also disables automatic suppression of a receiver-level keyboard node.
 
 ```toml
 [devices]
@@ -89,13 +102,16 @@ evdev  = "/dev/input/event5"
 ## CLI reference
 
 ```
-g602 [--config PATH] [--list-devices] [--check-config] [--trace] [--help]
+g602 [--config PATH] [--list-devices] [--check-config] [--help]
 
   --config, -c PATH     Load config from PATH
   --list-devices, -l    Print resolved hidraw/evdev paths and all matching
                         nodes, then exit
   --check-config, -C    Parse and validate config, then exit
-  --trace, -t           Print every hidraw report and evdev event to stderr
+  --verbose, -v         Print hidraw reports and evdev events except EV_REL
+                        movement and EV_SYN frame delimiters
+                        Use -vv to include all evdev events
+  --trace, -t           Alias for -v
   --help, -h            Show usage
 ```
 
@@ -126,6 +142,13 @@ The module:
 - Installs udev rules granting the group access to the G602 hidraw/evdev nodes and `/dev/uinput`
 - Loads the `uinput` kernel module
 - Installs a per-user systemd service that starts on login
+
+The service validates its config before starting. An invalid config is not retried, so start the service after correcting it. Other failure paths permit at most five starts in one minute. After that limit, fix the cause and run:
+
+```sh
+systemctl --user reset-failed g602
+systemctl --user start g602
+```
 
 ### Declarative bindings
 
