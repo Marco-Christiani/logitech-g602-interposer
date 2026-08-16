@@ -20,7 +20,14 @@ pub const RunOptions = struct {
     config_path: ?[]const u8 = null,
     hidraw_path: []const u8,
     evdev_path: []const u8,
-    trace: bool = false,
+
+    /// Optional receiver keyboard node to grab and drain. Used when the kernel
+    /// exposes receiver-level evdev nodes instead of a logical G602 child.
+    evdev_suppress_path: ?[]const u8 = null,
+
+    /// 0: normal logging, 1: hidraw snapshots plus evdev key/MSC events,
+    /// 2: all evdev events including movement and SYN_REPORT.
+    verbosity: u8 = 0,
 };
 
 /// Upper bound on held entries.
@@ -51,6 +58,10 @@ pub fn run(allocator: std.mem.Allocator, opts: RunOptions) !void {
 pub const State = struct {
     hidraw_fd: c_int,
     evdev_fd: c_int,
+
+    /// Extra grabbed evdev fd for receiver firmware key events. -1 when the
+    /// selected pointer node already owns that event stream.
+    suppress_fd: c_int = -1,
     vmouse_fd: c_int,
     vkbd_fd: c_int,
     sig_fd: c_int,
@@ -62,7 +73,7 @@ pub const State = struct {
     cfg: config_mod.Config,
     config_path: ?[]const u8 = null,
     config_basename: []const u8 = "",
-    trace: bool = false,
+    verbosity: u8 = 0,
 
     /// Last held-mask snapshot from hidraw.
     held_mask: u16 = 0,
@@ -112,11 +123,23 @@ pub const State = struct {
         const vkbd_fd = try linux.create_virtual_keyboard(.{ .keycodes = config_mod.all_key_codes });
         errdefer linux.destroy_uinput(vkbd_fd);
 
-        // Grab real evdev LAST
+        // Grab real evdev last so the virtual devices are ready before the
+        // physical pointer is intercepted.
         const evdev_fd = try linux.open_and_grab_evdev(&evdev_z);
         errdefer {
             linux.ungrab_evdev(evdev_fd);
             _ = c.close(evdev_fd);
+        }
+
+        var suppress_fd: c_int = -1;
+        if (opts.evdev_suppress_path) |path| {
+            const path_z = try to_sentinel(path);
+            suppress_fd = try linux.open_and_grab_evdev(&path_z);
+            errdefer {
+                linux.ungrab_evdev(suppress_fd);
+                _ = c.close(suppress_fd);
+            }
+            log.info("suppressing firmware evdev node {s}", .{path});
         }
 
         const sig_fd = try linux.setup_signalfd();
@@ -136,6 +159,7 @@ pub const State = struct {
         return .{
             .hidraw_fd = hidraw_fd,
             .evdev_fd = evdev_fd,
+            .suppress_fd = suppress_fd,
             .vmouse_fd = vmouse_fd,
             .vkbd_fd = vkbd_fd,
             .sig_fd = sig_fd,
@@ -144,7 +168,7 @@ pub const State = struct {
             .cfg = opts.config,
             .config_path = opts.config_path,
             .config_basename = basename,
-            .trace = opts.trace,
+            .verbosity = opts.verbosity,
         };
     }
 
@@ -177,6 +201,10 @@ pub const State = struct {
         //  process is about to exit either way
         linux.ungrab_evdev(self.evdev_fd);
         _ = c.close(self.evdev_fd);
+        if (self.suppress_fd >= 0) {
+            linux.ungrab_evdev(self.suppress_fd);
+            _ = c.close(self.suppress_fd);
+        }
         linux.destroy_uinput(self.vmouse_fd);
         linux.destroy_uinput(self.vkbd_fd);
         _ = c.close(self.hidraw_fd);
@@ -186,17 +214,24 @@ pub const State = struct {
     }
 
     pub fn loop(self: *State) !void {
-        log.info("running. hidraw_fd={d} evdev_fd={d}", .{ self.hidraw_fd, self.evdev_fd });
+        log.info("running. hidraw_fd={d} evdev_fd={d} suppress_fd={d}", .{ self.hidraw_fd, self.evdev_fd, self.suppress_fd });
         if (self.inotify_fd >= 0) log.info("hot reload watching {s}", .{self.config_path.?});
 
-        var fds_storage = [_]linux.PollFd{
-            .{ .fd = self.hidraw_fd, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = self.evdev_fd, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = self.sig_fd, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = -1, .events = c.POLLIN, .revents = 0 },
-        };
-        const fds_len: usize = if (self.inotify_fd >= 0) 4 else 3;
-        if (self.inotify_fd >= 0) fds_storage[3].fd = self.inotify_fd;
+        var fds_storage: [5]linux.PollFd = @splat(.{ .fd = -1, .events = c.POLLIN, .revents = 0 });
+        fds_storage[0] = .{ .fd = self.hidraw_fd, .events = c.POLLIN, .revents = 0 };
+        fds_storage[1] = .{ .fd = self.evdev_fd, .events = c.POLLIN, .revents = 0 };
+        fds_storage[2] = .{ .fd = self.sig_fd, .events = c.POLLIN, .revents = 0 };
+        var fds_len: usize = 3;
+        const inotify_index = fds_len;
+        if (self.inotify_fd >= 0) {
+            fds_storage[fds_len] = .{ .fd = self.inotify_fd, .events = c.POLLIN, .revents = 0 };
+            fds_len += 1;
+        }
+        const suppress_index = fds_len;
+        if (self.suppress_fd >= 0) {
+            fds_storage[fds_len] = .{ .fd = self.suppress_fd, .events = c.POLLIN, .revents = 0 };
+            fds_len += 1;
+        }
         const fds = fds_storage[0..fds_len];
 
         while (true) {
@@ -220,7 +255,7 @@ pub const State = struct {
                 }
             }
 
-            if (fds_len > 3 and (fds[3].revents & c.POLLIN) != 0) {
+            if (self.inotify_fd >= 0 and (fds[inotify_index].revents & c.POLLIN) != 0) {
                 self.handle_inotify() catch |err| {
                     log.warn("inotify read failed: {s}", .{@errorName(err)});
                 };
@@ -238,6 +273,10 @@ pub const State = struct {
                 try self.handle_evdev();
             }
 
+            if (self.suppress_fd >= 0 and (fds[suppress_index].revents & c.POLLIN) != 0) {
+                try self.drain_suppress_evdev();
+            }
+
             // Hangups are fatal, the process exits and systemd restarts
             if ((fds[0].revents & (c.POLLHUP | c.POLLERR)) != 0) {
                 log.warn("hidraw fd hung up", .{});
@@ -245,6 +284,10 @@ pub const State = struct {
             }
             if ((fds[1].revents & (c.POLLHUP | c.POLLERR)) != 0) {
                 log.warn("evdev fd hung up", .{});
+                return error.DeviceDisconnected;
+            }
+            if (self.suppress_fd >= 0 and (fds[suppress_index].revents & (c.POLLHUP | c.POLLERR)) != 0) {
+                log.warn("suppress evdev fd hung up", .{});
                 return error.DeviceDisconnected;
             }
         }
@@ -296,7 +339,7 @@ pub const State = struct {
         var old = self.cfg;
         self.cfg = new_cfg;
         old.deinit();
-        log_mod.setLevel(self.cfg.log_level);
+        log_mod.setLevel(if (self.verbosity > 0) .debug else self.cfg.log_level);
         var bound_count: usize = 0;
         for (self.cfg.bindings) |b| if (b != null) {
             bound_count += 1;
@@ -310,7 +353,7 @@ pub const State = struct {
     fn handle_hidraw(self: *State) !void {
         var buf: [64]u8 = undefined;
         const bytes = try linux.read_hidraw(self.hidraw_fd, &buf);
-        if (self.trace) trace_hidraw(bytes);
+        if (self.verbosity > 0) trace_hidraw(bytes);
         switch (g602.parseHidrawReport(bytes)) {
             .ignore => {},
             .malformed => {
@@ -324,7 +367,7 @@ pub const State = struct {
                     }
                 }
                 self.current_mode = snap.mode;
-                if (self.trace) {
+                if (self.verbosity > 0) {
                     const diff = g602.diffMask(self.held_mask, snap.mask);
                     print(
                         "hidraw: mask=0x{x:0>4} mode={s} prev=0x{x:0>4} pressed=0x{x:0>4} released=0x{x:0>4}\n",
@@ -466,10 +509,10 @@ pub const State = struct {
                 continue;
             }
             const action = g602.classifyEvdev(ev);
-            if (self.trace) trace_evdev(ev, action);
+            if (self.verbosity > 0) trace_evdev(ev, action, self.verbosity);
             switch (action) {
                 .forward_mouse => try self.forward_mouse_event(ev),
-                .drop => {}, // leaked firmware key or MSC_SCAN
+                .drop => {},
                 .syn_report => try self.flush_frame(),
                 .syn_dropped => {
                     log.warn("[evdev] SYN_DROPPED, discarding until next SYN_REPORT", .{});
@@ -477,6 +520,14 @@ pub const State = struct {
                 },
                 .unknown => log.debug("[evdev] ignoring type={d} code={d}", .{ ev.type, ev.code }),
             }
+        }
+    }
+
+    fn drain_suppress_evdev(self: *State) !void {
+        var buf: [64]g602.InputEvent = undefined;
+        const events = try linux.read_input_events(self.suppress_fd, &buf);
+        if (self.verbosity > 0 and events.len != 0) {
+            print("suppress evdev: dropped {d} events\n", .{events.len});
         }
     }
 
@@ -578,7 +629,9 @@ fn trace_hidraw(bytes: []const u8) void {
     print("\n", .{});
 }
 
-fn trace_evdev(ev: g602.InputEvent, action: g602.EvdevAction) void {
+fn trace_evdev(ev: g602.InputEvent, action: g602.EvdevAction, verbosity: u8) void {
+    if (verbosity < 2 and (ev.type == c.EV_REL or ev.type == c.EV_SYN)) return;
+
     const type_s = switch (ev.type) {
         c.EV_SYN => "EV_SYN",
         c.EV_KEY => "EV_KEY",

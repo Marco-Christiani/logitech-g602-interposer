@@ -12,6 +12,7 @@ stdenv.mkDerivation (finalAttrs: {
   nativeBuildInputs = [zig.hook];
 
   zigBuildFlags = ["-Doptimize=ReleaseSafe"];
+  doCheck = true;
 
   meta = {
     description = "Userspace input interposer for the Logitech G602";

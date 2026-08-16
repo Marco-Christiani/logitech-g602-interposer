@@ -139,11 +139,14 @@ in {
     # Narrow per-subsystem stanzas. We deliberately do not grant the whole input
     #  subsystem to g602, only the specific G602 device nodes and /dev/uinput.
     services.udev.extraRules = ''
-      # Logitech G602 - raw HID for the G-button snapshot stream
-      SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="402c", GROUP="g602", MODE="0660"
+      # Logitech G602 receiver and logical HID++ hidraw nodes
+      SUBSYSTEM=="hidraw", KERNELS=="0003:046D:C537.*", GROUP="g602", MODE="0660"
+      SUBSYSTEM=="hidraw", KERNELS=="0003:046D:402C.*", GROUP="g602", MODE="0660"
 
-      # Logitech G602 - evdev node (exclusively grabbed by the daemon)
-      SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="402c", GROUP="g602", MODE="0660"
+      # Logitech G602 pointer evdev node, either logical HID++ or receiver-level
+      SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="046d", ATTRS{id/product}=="402c", ATTRS{name}=="Logitech G602", ATTRS{capabilities/rel}!="0", GROUP="g602", MODE="0660"
+      SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="046d", ATTRS{id/product}=="c537", ATTRS{name}=="Logitech USB Receiver", ATTRS{capabilities/rel}!="0", GROUP="g602", MODE="0660"
+      SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="046d", ATTRS{id/product}=="c537", ATTRS{name}=="Logitech USB Receiver Keyboard", ATTRS{capabilities/key}!="0", GROUP="g602", MODE="0660"
 
       # /dev/uinput for creating the virtual mouse + virtual keyboard
       KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="g602", MODE="0660"
@@ -151,16 +154,14 @@ in {
 
     # /dev/uinput only exists when the uinput module is loaded.
     # Not loaded by default on some kernels.
-    boot.kernelModules = ["uinput"];
+    boot.kernelModules =
+      ["uinput"]
+      ++ lib.optionals cfg.silenceKernelSpam [
+        "hid_logitech_dj"
+      ];
 
     boot.extraModulePackages = lib.optionals cfg.silenceKernelSpam [
       (config.boot.kernelPackages.callPackage ./hid-logitech-dj.nix {})
-    ];
-
-    # The patched out-of-tree module replaces the in-tree one. Both cannot
-    # be loaded simultaneously; blacklisting ensures the kernel loads ours.
-    boot.blacklistedKernelModules = lib.optionals cfg.silenceKernelSpam [
-      "hid_logitech_dj"
     ];
 
     environment.systemPackages = [cfg.package];

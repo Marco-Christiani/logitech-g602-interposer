@@ -26,6 +26,7 @@
       ];
 
       perSystem = {
+        config,
         system,
         pkgs,
         ...
@@ -36,6 +37,10 @@
 
         packages.default = pkgs.callPackage ./nix/package.nix {};
         packages.hid-logitech-dj-patched = pkgs.linuxPackages.callPackage ./nix/hid-logitech-dj.nix {};
+        checks = {
+          g602 = config.packages.default;
+          inherit (config.packages) hid-logitech-dj-patched;
+        };
 
         formatter = pkgs.alejandra;
       };

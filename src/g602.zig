@@ -4,7 +4,12 @@ const std = @import("std");
 const c = @import("c");
 
 pub const VID_LOGITECH: u16 = 0x046d;
-pub const PID_G602: u16 = 0x402c;
+
+/// USB product ID for the physical receiver bundled with the G602.
+pub const PID_G602_RECEIVER: u16 = 0xc537;
+
+/// HID++ product ID for the logical paired G602 device.
+pub const HIDPP_PID_G602: u16 = 0x402c;
 
 pub const HIDRAW_REPORT_LEN: usize = 5;
 

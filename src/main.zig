@@ -30,8 +30,10 @@ const usage =
     \\                        If no file is found, a built-in default is used.
     \\  --list-devices, -l    Print resolved hidraw and evdev paths, then exit.
     \\  --check-config, -C    Parse and validate the config, then exit.
-    \\  --trace, -t           Print every hidraw report and evdev event to stderr
-    \\                        along with classification decisions.
+    \\  --verbose, -v         Print hidraw reports and evdev events except
+    \\                        EV_REL movement and EV_SYN frame delimiters.
+    \\                        Use -vv to include all evdev events.
+    \\  --trace, -t           Alias for -v.
     \\  --help, -h            Show this message.
     \\
 ;
@@ -49,7 +51,7 @@ const Cli = struct {
     config_path: ?[]const u8 = null,
     list_devices: bool = false,
     check_config: bool = false,
-    trace: bool = false,
+    verbosity: u8 = 0,
     help: bool = false,
 
     fn from_args(args: std.process.Args) !Cli {
@@ -64,7 +66,11 @@ const Cli = struct {
             } else if (str_eq_any(a, &.{ "--check-config", "-C" })) {
                 out.check_config = true;
             } else if (str_eq_any(a, &.{ "--trace", "-t" })) {
-                out.trace = true;
+                out.verbosity = @max(out.verbosity, 1);
+            } else if (str_eq_any(a, &.{ "--verbose", "-v" })) {
+                out.verbosity = @min(out.verbosity + 1, 2);
+            } else if (str_eq(a, "-vv")) {
+                out.verbosity = @max(out.verbosity, 2);
             } else if (str_eq_any(a, &.{ "--config", "-c" })) {
                 out.config_path = iter.next() orelse return error.MissingArgument;
             } else {
@@ -92,7 +98,7 @@ pub fn main(init: std.process.Init) !u8 {
         print("error: failed to load config: {s}\n", .{@errorName(err)});
         return 1;
     };
-    log_mod.setLevel(loaded.cfg.log_level);
+    log_mod.setLevel(if (cli.verbosity > 0) .debug else loaded.cfg.log_level);
 
     if (cli.check_config) {
         print("config OK\n", .{});
@@ -135,9 +141,14 @@ pub fn main(init: std.process.Init) !u8 {
 
     const resolved_hidraw = hidraw_path orelse auto_res.?.hidraw_path;
     const resolved_evdev = evdev_path orelse auto_res.?.evdev_path;
+    const resolved_suppress_evdev = if (evdev_path == null and auto_res != null)
+        auto_res.?.evdev_suppress_path
+    else
+        null;
 
     if (cli.list_devices) {
         print("Selected:\n  hidraw: {s}\n  evdev:  {s}\n\n", .{ resolved_hidraw, resolved_evdev });
+        if (resolved_suppress_evdev) |p| print("Suppressed evdev:\n  {s}\n\n", .{p});
         print("All matching G602 nodes:\n", .{});
         var nodes = linux.list_all_matching(arena_alloc) catch |err| {
             print("  (listing failed: {s})\n", .{@errorName(err)});
@@ -170,7 +181,8 @@ pub fn main(init: std.process.Init) !u8 {
         .config_path = loaded.path,
         .hidraw_path = resolved_hidraw,
         .evdev_path = resolved_evdev,
-        .trace = cli.trace,
+        .evdev_suppress_path = resolved_suppress_evdev,
+        .verbosity = cli.verbosity,
     }) catch |err| {
         log.err("daemon exited with error: {s}", .{@errorName(err)});
         return err;

@@ -11,10 +11,12 @@ pub const InputEvent = g602.InputEvent;
 pub const DeviceResolution = struct {
     hidraw_path: []const u8,
     evdev_path: []const u8,
+    evdev_suppress_path: ?[]const u8 = null,
 
     pub fn free(self: DeviceResolution, allocator: std.mem.Allocator) void {
         allocator.free(self.hidraw_path);
         allocator.free(self.evdev_path);
+        if (self.evdev_suppress_path) |p| allocator.free(p);
     }
 };
 
@@ -348,24 +350,31 @@ pub const InotifyIter = struct {
 
 const HID_ID_BUS_USB: u16 = 0x0003;
 
-/// Resolve the target G602 hidraw and evdev nodes under /sys.
+/// Resolve the G602 hidraw snapshot stream and pointer evdev node under /sys.
 ///
 /// Strategy:
 ///   - Scan /sys/class/hidraw/hidrawN. For each, read device/uevent and match
-///     HID_ID against the expected `0003:<vid>:<pid>`. The G602 receiver
-///     exposes one hidraw per logical interface. We pick the one that reports
-///     5-byte G-button snapshots. Picking the wrong one is handled by the
-///     caller (they can override via config).
+///     HID_ID against the Logitech vendor ID. Then read the HID report
+///     descriptor and require Report ID 0x80, the G-button snapshot stream.
 ///   - Scan /sys/class/input/eventN. For each, read device/id/vendor and
-///     device/id/product. Pick the one that advertises EV_REL, which on this
-///     receiver is the merged mouse node we need to grab.
+///     device/id/product. Accept either the HID++ G602 product ID or the
+///     receiver product ID, then require REL_X and REL_Y so keyboard and
+///     consumer-control nodes are rejected.
+///   - When only receiver-level evdev nodes are exposed, also return the
+///     receiver keyboard node so the daemon can grab and drain firmware key
+///     events that would otherwise reach the desktop.
 ///
 /// Returned paths are owned by the caller and must be freed.
 pub fn resolve_g602(allocator: std.mem.Allocator) !DeviceResolution {
     const hidraw = try resolve_hidraw(allocator);
     errdefer allocator.free(hidraw);
     const evdev = try resolve_evdev(allocator);
-    return .{ .hidraw_path = hidraw, .evdev_path = evdev };
+    errdefer evdev.free(allocator);
+    return .{
+        .hidraw_path = hidraw,
+        .evdev_path = evdev.pointer_path,
+        .evdev_suppress_path = evdev.suppress_path,
+    };
 }
 
 pub const NodeInfo = struct {
@@ -383,7 +392,7 @@ pub const NodeInfo = struct {
     }
 };
 
-/// Enumerate all hidraw and evdev nodes matching the G602 vid/pid.
+/// Enumerate all hidraw and evdev nodes relevant to the G602.
 ///
 /// Useful for debugging when a physical button does not appear on the auto-
 ///  selected node and we need to check whether it is on a sibling node.
@@ -417,9 +426,7 @@ pub fn list_all_matching(allocator: std.mem.Allocator) !std.ArrayList(NodeInfo) 
                 const has_snap = descriptor_declares_report_id(desc, g602.HIDRAW_PREFIX_B0);
 
                 const hid_name = extract_uevent_field(body, "HID_NAME") orelse "";
-                // caps_key reused as a free-form tag for hidraws (caps don't
-                //  apply). "snapshot" marks the node carrying our report ID
-                //  0x80 stream.
+                // `caps_key` carries a display tag for hidraw rows.
                 const tag = if (has_snap) "snapshot" else "";
                 const info: NodeInfo = .{
                     .kind = .hidraw,
@@ -445,7 +452,7 @@ pub fn list_all_matching(allocator: std.mem.Allocator) !std.ArrayList(NodeInfo) 
                 if (!std.mem.startsWith(u8, entname, "event")) continue;
                 const vendor = read_u16_hex(allocator, "/sys/class/input", entname, "device/id/vendor") catch continue;
                 const product = read_u16_hex(allocator, "/sys/class/input", entname, "device/id/product") catch continue;
-                if (vendor != g602.VID_LOGITECH or product != g602.PID_G602) continue;
+                if (!is_g602_evdev_identity(vendor, product)) continue;
 
                 const name_path = try std.fmt.allocPrint(allocator, "/sys/class/input/{s}/device/name", .{entname});
                 defer allocator.free(name_path);
@@ -543,15 +550,9 @@ fn hid_id_vendor_matches(uevent: []const u8, vid: u16) bool {
 
 /// Resolve the hidraw delivering the G602 G-button snapshot stream.
 ///
-/// Strategy: walk all Logitech-VID hidraws (both the G602's own PID and the
-///  receiver's PID), read the report descriptor for each, and pick the one
-///  that declares Report ID 0x80 (our snapshot stream).
-///
-/// Why not match by G602 PID alone: on a Unifying receiver the snapshot stream
-///  is usually emitted on a *receiver-level* hidraw (HID_ID = receiver PID),
-///  not the hidraw that demuxes per-device standard HID reports (HID_ID = G602
-///  PID). A PID-only match picks the latter, which only carries firmware
-///  combos and mouse motion, not snapshots.
+/// The snapshot stream is identified by report descriptor, not product ID.
+/// Logitech receivers may expose the stream on either receiver-level or
+/// logical HID++ hidraw nodes depending on kernel driver binding.
 fn resolve_hidraw(allocator: std.mem.Allocator) ![]const u8 {
     var candidates: std.ArrayList([]u8) = .empty;
     defer {
@@ -590,12 +591,13 @@ fn resolve_hidraw(allocator: std.mem.Allocator) ![]const u8 {
         try candidates.append(allocator, path);
     }
 
-    if (candidates.items.len == 0) return error.DeviceNotFound;
+    if (candidates.items.len == 0) {
+        log.warn("No hidraw candidates found", .{});
+        return error.DeviceNotFound;
+    }
 
-    // Tie-break: highest-numbered node. Survives renumbering on replug because
-    //  the descriptor filter already picked uniquely-qualified nodes; this
-    //  only matters in edge cases where multiple Logitech receivers each have
-    //  a snapshot-capable hidraw, which is exotic enough to leave to [devices].
+    // When multiple Logitech hidraws expose the snapshot report, prefer the
+    // later node. Users can pin a path in [devices] for multi-receiver setups.
     std.mem.sort([]u8, candidates.items, {}, struct {
         fn lessThan(_: void, a: []u8, b: []u8) bool {
             return hidrawNum(a) < hidrawNum(b);
@@ -610,9 +612,25 @@ fn resolve_hidraw(allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, chosen);
 }
 
-fn resolve_evdev(allocator: std.mem.Allocator) ![]const u8 {
-    var best: ?[]u8 = null;
-    errdefer if (best) |b| allocator.free(b);
+const EvdevResolution = struct {
+    pointer_path: []const u8,
+    suppress_path: ?[]const u8 = null,
+
+    fn free(self: EvdevResolution, allocator: std.mem.Allocator) void {
+        allocator.free(self.pointer_path);
+        if (self.suppress_path) |p| allocator.free(p);
+    }
+};
+
+/// Resolve the pointer evdev node and, when using receiver fallback mode, the
+/// sibling receiver keyboard node that must be drained.
+fn resolve_evdev(allocator: std.mem.Allocator) !EvdevResolution {
+    var best_path: ?[]u8 = null;
+    errdefer if (best_path) |p| allocator.free(p);
+    var best_score: u8 = 0;
+
+    var suppress_path: ?[]u8 = null;
+    errdefer if (suppress_path) |p| allocator.free(p);
 
     const dirp = c.opendir("/sys/class/input");
     if (dirp == null) return error.SysfsUnavailable;
@@ -625,30 +643,126 @@ fn resolve_evdev(allocator: std.mem.Allocator) ![]const u8 {
         if (!std.mem.startsWith(u8, name, "event")) continue;
         const vendor = read_u16_hex(allocator, "/sys/class/input", name, "device/id/vendor") catch continue;
         const product = read_u16_hex(allocator, "/sys/class/input", name, "device/id/product") catch continue;
-        if (vendor != g602.VID_LOGITECH or product != g602.PID_G602) continue;
+        if (!is_g602_evdev_identity(vendor, product)) continue;
 
-        const caps_path = try std.fmt.allocPrint(allocator, "/sys/class/input/{s}/device/capabilities/rel", .{name});
-        defer allocator.free(caps_path);
-        const caps = read_small_file(allocator, caps_path) catch continue;
-        defer allocator.free(caps);
-        if (!has_any_rel_bit(caps)) continue;
+        const rel = read_input_file_trimmed(allocator, name, "capabilities/rel") catch continue;
+        defer allocator.free(rel);
+        const dev_name = read_input_file_trimmed(allocator, name, "name") catch try allocator.dupe(u8, "");
+        defer allocator.free(dev_name);
 
-        const path = try std.fmt.allocPrint(allocator, "/dev/input/{s}", .{name});
-        if (best) |b| allocator.free(b);
-        best = path;
+        if (has_pointer_rel_axes(rel)) {
+            const score: u8 = if (product == g602.HIDPP_PID_G602) 2 else 1;
+            if (score > best_score or (score == best_score and best_path == null)) {
+                if (best_path) |p| allocator.free(p);
+                best_path = try std.fmt.allocPrint(allocator, "/dev/input/{s}", .{name});
+                best_score = score;
+                log.debug(
+                    "resolved evdev candidate /dev/input/{s}: name=\"{s}\" vendor=0x{x:0>4} product=0x{x:0>4} rel=\"{s}\"",
+                    .{ name, dev_name, vendor, product, rel },
+                );
+            }
+            continue;
+        }
+
+        if (is_receiver_keyboard_node(product, dev_name)) {
+            const key = read_input_file_trimmed(allocator, name, "capabilities/key") catch continue;
+            defer allocator.free(key);
+            if (!has_any_capability_bit(key)) continue;
+            if (suppress_path == null) {
+                suppress_path = try std.fmt.allocPrint(allocator, "/dev/input/{s}", .{name});
+                log.debug("resolved suppress evdev /dev/input/{s}: name=\"{s}\" key=\"{s}\"", .{ name, dev_name, key });
+            }
+        }
     }
 
-    return best orelse error.DeviceNotFound;
+    if (best_path) |p| {
+        if (best_score != 1) {
+            if (suppress_path) |s| allocator.free(s);
+            suppress_path = null;
+        }
+        return .{ .pointer_path = p, .suppress_path = suppress_path };
+    }
+    log.warn("Could not resolve G602 evdev pointer node", .{});
+    log_evdev_scan(allocator);
+    return error.DeviceNotFound;
 }
 
-fn has_any_rel_bit(caps_text: []const u8) bool {
-    // capabilities/rel is a space-separated hex bitmask (e.g. "1943" or
-    //  "0 1943") and any non-zero word means at least one REL axis
-    //  is advertised.
+fn is_g602_evdev_identity(vendor: u16, product: u16) bool {
+    return vendor == g602.VID_LOGITECH and
+        (product == g602.HIDPP_PID_G602 or product == g602.PID_G602_RECEIVER);
+}
+
+fn is_receiver_keyboard_node(product: u16, name: []const u8) bool {
+    return product == g602.PID_G602_RECEIVER and
+        std.mem.eql(u8, name, "Logitech USB Receiver Keyboard");
+}
+
+fn log_evdev_scan(allocator: std.mem.Allocator) void {
+    const dirp = c.opendir("/sys/class/input") orelse return;
+    defer _ = c.closedir(dirp);
+    while (true) {
+        const ent = c.readdir(dirp);
+        if (ent == null) break;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, name, "event")) continue;
+        const vendor = read_u16_hex(allocator, "/sys/class/input", name, "device/id/vendor") catch continue;
+        const product = read_u16_hex(allocator, "/sys/class/input", name, "device/id/product") catch continue;
+        const dev_name = read_input_file_trimmed(allocator, name, "name") catch null;
+        defer if (dev_name) |s| allocator.free(s);
+        const rel = read_input_file_trimmed(allocator, name, "capabilities/rel") catch null;
+        defer if (rel) |s| allocator.free(s);
+        const phys = read_input_file_trimmed(allocator, name, "phys") catch null;
+        defer if (phys) |s| allocator.free(s);
+        log.warn(
+            "scanned evdev /dev/input/{s}: name=\"{s}\" vendor=0x{x:0>4} product=0x{x:0>4} rel=\"{s}\" phys=\"{s}\"",
+            .{ name, dev_name orelse "", vendor, product, rel orelse "", phys orelse "" },
+        );
+    }
+}
+
+fn read_input_file_trimmed(allocator: std.mem.Allocator, event_name: []const u8, leaf: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "/sys/class/input/{s}/device/{s}", .{ event_name, leaf });
+    defer allocator.free(path);
+    const raw = try read_small_file(allocator, path);
+    defer allocator.free(raw);
+    return try allocator.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+fn has_pointer_rel_axes(caps_text: []const u8) bool {
+    return has_capability_bit(caps_text, @intCast(c.REL_X)) and
+        has_capability_bit(caps_text, @intCast(c.REL_Y));
+}
+
+fn has_any_capability_bit(caps_text: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, caps_text, " \t\n\r");
     while (it.next()) |word| {
-        const v = std.fmt.parseInt(u64, word, 16) catch continue;
-        if (v != 0) return true;
+        const value = std.fmt.parseInt(u64, word, 16) catch continue;
+        if (value != 0) return true;
+    }
+    return false;
+}
+
+fn has_capability_bit(caps_text: []const u8, bit: usize) bool {
+    const word_bits = @bitSizeOf(c_ulong);
+
+    var word_count: usize = 0;
+    var count_it = std.mem.tokenizeAny(u8, caps_text, " \t\n\r");
+    while (count_it.next() != null) {
+        word_count += 1;
+    }
+    if (word_count == 0) return false;
+
+    const word_from_right = bit / word_bits;
+    if (word_from_right >= word_count) return false;
+    const target_index = word_count - 1 - word_from_right;
+
+    var word_index: usize = 0;
+    var it = std.mem.tokenizeAny(u8, caps_text, " \t\n\r");
+    while (it.next()) |word| : (word_index += 1) {
+        if (word_index != target_index) continue;
+        const value = std.fmt.parseInt(u64, word, 16) catch return false;
+        const shift: u6 = @intCast(bit % word_bits);
+        return (value & (@as(u64, 1) << shift)) != 0;
     }
     return false;
 }
@@ -697,17 +811,20 @@ test "hid_id_vendor_matches: non-logitech rejected" {
 }
 
 test "hid_id_vendor_matches: receiver pid still matches on vid" {
-    // Receiver-level hidraw advertises the receiver PID (c537), not the G602
-    //  PID; the new resolver matches by VID alone so this must accept.
+    // Receiver-level hidraw advertises the receiver PID. The hidraw resolver
+    // matches by VID so receiver-level interfaces remain candidates.
     const uevent = "HID_ID=0003:0000046D:0000C537\n";
     try std.testing.expect(hid_id_vendor_matches(uevent, 0x046d));
 }
 
-test "hasAnyRelBit: present" {
-    try std.testing.expect(has_any_rel_bit("1943\n"));
-    try std.testing.expect(has_any_rel_bit("0 1943\n"));
-    try std.testing.expect(!has_any_rel_bit("0\n"));
-    try std.testing.expect(!has_any_rel_bit("0 0\n"));
+test "has_pointer_rel_axes: requires x and y" {
+    try std.testing.expect(has_pointer_rel_axes("1943\n"));
+    try std.testing.expect(has_pointer_rel_axes("0 1943\n"));
+    try std.testing.expect(!has_pointer_rel_axes("1040\n"));
+    try std.testing.expect(!has_pointer_rel_axes("1\n"));
+    try std.testing.expect(!has_pointer_rel_axes("2\n"));
+    try std.testing.expect(!has_pointer_rel_axes("0\n"));
+    try std.testing.expect(!has_pointer_rel_axes("0 0\n"));
 }
 
 test "descriptor_declares_report_id: simple match" {
