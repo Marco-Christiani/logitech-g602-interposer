@@ -41,6 +41,7 @@
     if configFile != null
     then "${lib.getExe cfg.package} --config ${configFile}"
     else lib.getExe cfg.package;
+  execCheckConfig = "${execStart} --check-config";
 in {
   options.services.g602 = {
     enable = lib.mkEnableOption "the g602 userspace input interposer";
@@ -169,12 +170,19 @@ in {
     systemd.user.services.g602 = lib.mkIf cfg.autoStart {
       description = "G602 userspace input interposer";
       wantedBy = ["default.target"];
+      unitConfig = {
+        # Stop retrying after five failures in one minute. Resume after fixing
+        # the cause with `systemctl --user reset-failed g602 && systemctl --user start g602`.
+        StartLimitIntervalSec = "1min";
+        StartLimitBurst = 5;
+      };
       serviceConfig = {
+        # A malformed config is a persistent error, not a reason to restart.
+        ExecCondition = execCheckConfig;
         ExecStart = execStart;
         Restart = "on-failure";
-        # Back off enough that a genuinely broken config does not spin the
-        #  restart loop, but short enough to pick up the device soon after
-        #  the receiver appears.
+        # Retry transient receiver or uinput failures within the unit's
+        # explicit start limit.
         RestartSec = 3;
         # Journald captures stderr as the "info" level by default.
         StandardOutput = "journal";
